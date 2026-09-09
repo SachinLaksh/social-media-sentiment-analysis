@@ -1,0 +1,400 @@
+---
+title: "SMMA - Sentinment Analytics"
+format: html
+editor: visual
+
+execute: 
+  error: false
+  warnings: false
+  message: false
+---
+
+## SENTIMENT ANALYTICS
+
+## 1. Library Installation 
+
+```{r}
+#install.packages("tidytext")
+#install.packages("wordcloud")
+#install.packages("RColorBrewer")
+#install.packages("scales")
+
+library(tidyverse)      # dplyr, ggplot2, readr, stringr, tidyr
+library(tidytext)       # unnest_tokens(), stop_words, get_sentiments()
+library(wordcloud)
+library(RColorBrewer)
+library(scales)
+library(readr)
+```
+
+```{r}
+library(readxl)
+raw <- read_excel("C:\\Users\\Sachin\\OneDrive\\Desktop\\LIFE STORE\\MANIPAL PROGRESS\\SEM-3\\SMMA\\sentiment_lab_data.xlsx")
+
+View(raw)# <- EDIT THIS PATH
+
+dim(raw)                 # expect 500 rows x 13 columns
+glimpse(raw)
+head(raw, 5)
+summary(raw)
+```
+
+```{r}
+# Missing values per column
+colSums(is.na(raw))
+
+# Category levels BEFORE cleaning - note the inconsistent spellings
+table(raw$platform, useNA = "ifany")
+table(raw$verified_account, useNA = "ifany")
+table(raw$region, useNA = "ifany")
+table(raw$human_label)
+
+```
+
+## 2. Data Cleaning 
+### 2A. Standardise the categorical variables
+
+```{r}
+dat <- raw %>%
+  mutate(
+    platform = str_to_lower(str_trim(platform)),
+    platform = case_when(
+      str_detect(platform, "insta")            ~ "Instagram",
+      str_detect(platform, "youtube")          ~ "YouTube",
+      str_detect(platform, "^x|twitter")       ~ "X",
+      str_detect(platform, "face")             ~ "Facebook",
+      TRUE                                     ~ "Other"),
+    verified_account = if_else(str_to_lower(str_trim(verified_account)) == "yes",
+                               "Yes", "No"),
+    region      = na_if(str_trim(region), ""),
+    post_date   = as.Date(post_date),
+    week        = floor_date(post_date, unit = "week"),
+    human_label = factor(human_label, levels = c("Negative", "Neutral", "Positive"))
+  )
+
+table(dat$platform)          # now only 4 clean levels
+
+```
+
+### 2B. Duplicate (reposted / spam) comments
+
+```{r}
+sum(duplicated(dat$comment_text))            # how many exact repeats?
+dat %>% filter(duplicated(comment_text) |
+               duplicated(comment_text, fromLast = TRUE)) %>%
+  arrange(comment_text) %>%
+  select(comment_id, platform, comment_text) %>%
+  print(n = 20)
+
+dat <- dat %>% distinct(comment_text, .keep_all = TRUE)   # keep first occurrence
+nrow(dat)                                                 # rows retained
+```
+
+### 2C. Missing engagement values
+
+```{r}
+# Median imputation within platform (report the count you imputed)
+dat <- dat %>%
+  group_by(platform) %>%
+  mutate(likes_imp = if_else(is.na(likes),
+                             median(likes, na.rm = TRUE), as.numeric(likes))) %>%
+  ungroup()
+```
+
+### 2D. Text cleaning
+
+```{r}
+dat <- dat %>%
+  mutate(
+    text_clean = comment_text,
+    text_clean = str_replace_all(text_clean, "http[s]?://\\S+", " "),   # URLs
+    text_clean = str_replace_all(text_clean, "@\\w+", " "),             # mentions
+    text_clean = str_replace_all(text_clean, "#\\w+", " "),             # hashtags
+    text_clean = str_replace_all(text_clean, "[^\\x01-\\x7F]", " "),    # emoji / non-ASCII
+    text_clean = str_to_lower(text_clean),
+    text_clean = str_replace_all(text_clean, "[[:digit:]]+", " "),
+    text_clean = str_replace_all(text_clean, "[[:punct:]]", " "),
+    text_clean = str_squish(text_clean),                                # collapse spaces
+    n_words    = str_count(text_clean, "\\S+")
+  )
+
+dat %>% select(comment_id, comment_text, text_clean) %>% head(3) %>% as.data.frame()
+summary(dat$n_words)
+```
+
+## 3. DESCRIPTIVE PROFILE
+
+```{r}
+## ---------------------------------------------------------------------------
+dat %>% count(platform, sort = TRUE) %>% mutate(pct = percent(n / sum(n)))
+dat %>% count(brand, human_label) %>% pivot_wider(names_from = human_label, values_from = n)
+
+dat %>%
+  group_by(human_label) %>%
+  summarise(comments  = n(),
+            mean_likes = round(mean(likes_imp), 1),
+            mean_repl  = round(mean(replies), 1),
+            mean_stars = round(mean(star_rating, na.rm = TRUE), 2))
+
+ggplot(dat, aes(x = fct_infreq(platform), fill = human_label)) +
+  geom_bar(position = "fill") +
+  scale_y_continuous(labels = percent) +
+  labs(title = "Human-coded sentiment mix by platform",
+       x = "Platform", y = "Share of comments", fill = "Sentiment")
+
+```
+## 4. TOKENISATION AND WORD FREQUENCY
+
+```{r}
+## ---------------------------------------------------------------------------
+custom_stop <- tibble(word = c("brand", "product", "amp", "just", "really",
+                               tolower(unique(dat$brand))))
+
+tokens <- dat %>%
+  select(comment_id, platform, brand, human_label, text_clean) %>%
+  unnest_tokens(word, text_clean) %>%
+  anti_join(stop_words, by = "word") %>%
+  anti_join(custom_stop, by = "word")
+
+nrow(tokens)                                   # total tokens after stopword removal
+
+top_words <- tokens %>% count(word, sort = TRUE) %>% slice_head(n = 20)
+top_words
+
+ggplot(top_words, aes(x = n, y = fct_reorder(word, n))) +
+  geom_col(fill = "steelblue") +
+  labs(title = "Twenty most frequent terms", x = "Frequency", y = NULL)
+```
+
+
+```{r}
+# Words that distinguish positive from negative comments
+tokens %>%
+  filter(human_label != "Neutral") %>%
+  count(human_label, word) %>%
+  group_by(human_label) %>%
+  slice_max(n, n = 10) %>%
+  ungroup() %>%
+  ggplot(aes(n, fct_reorder(word, n), fill = human_label)) +
+  geom_col(show.legend = FALSE) +
+  facet_wrap(~ human_label, scales = "free_y") +
+  labs(title = "Top terms within each sentiment class", x = "Frequency", y = NULL)
+
+```
+
+```{r}
+
+# Word cloud
+set.seed(6306)
+with(count(tokens, word, sort = TRUE),
+     wordcloud(word, n, max.words = 80, min.freq = 3,
+               colors = brewer.pal(8, "Dark2"), random.order = FALSE))
+```
+
+## 5. LEXICON-BASED SENTIMENT SCORING (BING)
+
+```{r}
+## ---------------------------------------------------------------------------
+bing <- get_sentiments("bing")     # bundled with tidytext, works offline
+
+comment_scores <- tokens %>%
+  inner_join(bing, by = "word") %>%
+  count(comment_id, sentiment) %>%
+  pivot_wider(names_from = sentiment, values_from = n, values_fill = 0) %>%
+  mutate(net_score = positive - negative)
+
+dat <- dat %>%
+  left_join(comment_scores, by = "comment_id") %>%
+  mutate(
+    positive  = replace_na(positive, 0),
+    negative  = replace_na(negative, 0),
+    net_score = replace_na(net_score, 0),
+    pred_label = factor(case_when(net_score > 0 ~ "Positive",
+                                  net_score < 0 ~ "Negative",
+                                  TRUE          ~ "Neutral"),
+                        levels = c("Negative", "Neutral", "Positive"))
+  )
+
+summary(dat$net_score)
+table(dat$pred_label)
+
+ggplot(dat, aes(x = net_score)) +
+  geom_histogram(binwidth = 1, fill = "grey30") +
+  labs(title = "Distribution of net Bing sentiment score",
+       x = "Positive words - negative words", y = "Comments")
+
+
+```
+## 6. VALIDATION AGAINST THE HUMAN-CODED LABEL
+
+```{r}
+cm <- table(Predicted = dat$pred_label, Actual = dat$human_label)
+cm
+
+accuracy <- sum(diag(cm)) / sum(cm)
+round(accuracy, 3)                       # <- report this number in your answer
+
+# Per-class precision, recall and F1
+perf <- tibble(class = colnames(cm)) %>%
+  rowwise() %>%
+  mutate(
+    TP        = cm[class, class],
+    precision = TP / sum(cm[class, ]),
+    recall    = TP / sum(cm[, class]),
+    f1        = 2 * precision * recall / (precision + recall)
+  ) %>%
+  ungroup() %>%
+  mutate(across(precision:f1, ~ round(.x, 3)))
+perf
+
+# Cohen's kappa (agreement corrected for chance)
+p_obs <- accuracy
+p_exp <- sum(rowSums(cm) / sum(cm) * colSums(cm) / sum(cm))
+kappa <- (p_obs - p_exp) / (1 - p_exp)
+round(kappa, 3)
+
+# Inspect the failures - this is where the marks are
+dat %>%
+  filter(pred_label != human_label) %>%
+  select(comment_id, human_label, pred_label, net_score, comment_text) %>%
+  slice_head(n = 15) %>%
+  as.data.frame()
+
+# The worst kind of error: negative comments called positive
+dat %>%
+  filter(human_label == "Negative", pred_label == "Positive") %>%
+  select(comment_id, net_score, comment_text) %>%
+  as.data.frame()
+
+
+```
+## 7. WHY THE LEXICON FAILS: NEGATION AND SARCASM
+
+```{r}
+## ---------------------------------------------------------------------------
+negators <- c("not", "no", "never", "without", "hardly", "zero", "nothing", "cannot")
+
+bigrams <- dat %>%
+  select(comment_id, text_clean) %>%
+  unnest_tokens(bigram, text_clean, token = "ngrams", n = 2) %>%
+  separate(bigram, c("w1", "w2"), sep = " ")
+
+negated_terms <- bigrams %>%
+  filter(w1 %in% negators) %>%
+  inner_join(bing, by = c("w2" = "word")) %>%
+  count(w1, w2, sentiment, sort = TRUE)
+negated_terms                   # every row here was scored with the wrong sign
+
+# Simple correction: flip the sign of any sentiment word preceded by a negator
+correction <- bigrams %>%
+  filter(w1 %in% negators) %>%
+  inner_join(bing, by = c("w2" = "word")) %>%
+  mutate(adj = if_else(sentiment == "positive", -2, 2)) %>%
+  group_by(comment_id) %>%
+  summarise(adjustment = sum(adj), .groups = "drop")
+
+dat <- dat %>%
+  left_join(correction, by = "comment_id") %>%
+  mutate(adjustment  = replace_na(adjustment, 0),
+         score_adj   = net_score + adjustment,
+         pred_adj    = factor(case_when(score_adj > 0 ~ "Positive",
+                                        score_adj < 0 ~ "Negative",
+                                        TRUE          ~ "Neutral"),
+                              levels = c("Negative", "Neutral", "Positive")))
+
+cm2 <- table(Predicted = dat$pred_adj, Actual = dat$human_label)
+cm2
+accuracy2 <- sum(diag(cm2)) / sum(cm2)
+round(accuracy2, 3)                      # compare with `accuracy` above
+round(accuracy2 - accuracy, 3)           # did negation handling help?
+```
+
+## 8. SENTIMENT ACROSS PLATFORMS AND BRANDS
+
+```{r}
+## ---------------------------------------------------------------------------
+brand_tab <- dat %>%
+  count(brand, human_label) %>%
+  group_by(brand) %>%
+  mutate(share = round(n / sum(n), 3)) %>%
+  ungroup()
+brand_tab %>% pivot_wider(id_cols = brand, names_from = human_label, values_from = share)
+
+# Net sentiment index per brand: (%positive - %negative)
+dat %>%
+  group_by(brand) %>%
+  summarise(n = n(),
+            NSI = round(100 * (mean(human_label == "Positive") -
+                               mean(human_label == "Negative")), 1)) %>%
+  arrange(desc(NSI))
+
+# Is sentiment independent of platform?
+chisq_platform <- chisq.test(table(dat$platform, dat$human_label))
+chisq_platform
+round(chisq_platform$expected, 1)        # check the >5 assumption before you interpret
+
+ggplot(brand_tab, aes(x = brand, y = share, fill = human_label)) +
+  geom_col(position = "dodge") +
+  scale_y_continuous(labels = percent) +
+  labs(title = "Sentiment share by brand", x = NULL, y = "Share", fill = "Sentiment")
+
+```
+## 9. DOES SENTIMENT DRIVE ENGAGEMENT?
+
+```{r}
+## ---------------------------------------------------------------------------
+dat <- dat %>% mutate(log_likes = log1p(likes_imp))
+
+dat %>%
+  group_by(human_label) %>%
+  summarise(n = n(), mean_likes = round(mean(likes_imp), 1),
+            median_likes = median(likes_imp), sd = round(sd(likes_imp), 1))
+
+aov_fit <- aov(log_likes ~ human_label, data = dat)
+summary(aov_fit)
+TukeyHSD(aov_fit)
+
+ggplot(dat, aes(x = human_label, y = likes_imp, fill = human_label)) +
+  geom_boxplot(show.legend = FALSE, outlier.alpha = 0.3) +
+  scale_y_log10(labels = comma) +
+  labs(title = "Likes by sentiment class (log scale)", x = NULL, y = "Likes")
+
+# Control for audience size and account type
+model <- lm(log_likes ~ human_label + log1p(user_followers) +
+              verified_account + platform, data = dat)
+summary(model)
+
+# Replies as a proxy for controversy
+lm(log1p(replies) ~ human_label + log1p(user_followers), data = dat) %>% summary()
+
+```
+## 10. SENTIMENT OVER TIME
+
+```{r}
+## ---------------------------------------------------------------------------
+weekly <- dat %>%
+  group_by(week) %>%
+  summarise(comments = n(),
+            NSI = 100 * (mean(human_label == "Positive") -
+                         mean(human_label == "Negative")), .groups = "drop")
+
+ggplot(weekly, aes(x = week, y = NSI)) +
+  geom_line(colour = "grey40") +
+  geom_point(aes(size = comments), colour = "steelblue") +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  labs(title = "Weekly net sentiment index",
+       x = NULL, y = "NSI  (%positive - %negative)", size = "Comments")
+
+
+```
+## 11. EXPORT
+```{r}
+write_csv(dat %>% select(comment_id, platform, brand, post_date, human_label,
+                         pred_label, pred_adj, net_score, score_adj,
+                         likes_imp, replies, comment_text),
+          "sentiment_scored_output.csv")
+
+sessionInfo()      # paste this into your submission for reproducibility
+
+```
+
